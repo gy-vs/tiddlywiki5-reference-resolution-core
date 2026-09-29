@@ -109,10 +109,17 @@ request: request instance passed to the handler
 response: response instance passed to the handler
 statusCode: stauts code to send to the browser
 headers: response headers (they will be augmented with an `Etag` header)
-data: the data to send (passed to the end method of the response instance)
+data: the data to send (passed to the end method of the response instance); a
+      readable stream is piped to the response without buffering, which keeps
+      large files served from the /files route out of memory
 encoding: the encoding of the data to send (passed to the end method of the response instance)
 */
 function sendResponse(request,response,statusCode,headers,data,encoding) {
+	// A readable stream (duck-typed) is streamed straight to the response
+	if(data && typeof data.pipe === "function") {
+		sendStreamResponse.call(this,request,response,statusCode,headers,data);
+		return;
+	}
 	if(this.enableBrowserCache && (statusCode == 200)) {
 		var hash = crypto.createHash('md5');
 		// Put everything into the hash that could change and invalidate the data that
@@ -144,7 +151,7 @@ function sendResponse(request,response,statusCode,headers,data,encoding) {
 		}
 	} else {
 		// RFC 7231, 6.1. Overview of Status Codes:
-		// Browser clients may cache 200, 203, 204, 206, 300, 301, 
+		// Browser clients may cache 200, 203, 204, 206, 300, 301,
 		// 404, 405, 410, 414, and 501 unless given explicit cache controls
 		headers["Cache-Control"] = headers["Cache-Control"] || "no-store";
 	}
@@ -168,6 +175,62 @@ function sendResponse(request,response,statusCode,headers,data,encoding) {
 
 	response.writeHead(statusCode,headers);
 	response.end(data,encoding);
+}
+
+/*
+Stream a readable file stream to the response. The data itself is never
+buffered on the server, which is what allows large /files media to be served.
+The route supplies a strong validator (ETag) and the response metadata
+(Content-Length/Content-Range), so the same conditional GET logic as for
+buffered responses applies. Streamed payloads are never compressed: a
+Content-Encoding on a byte range would make the advertised Content-Range
+uninterpretable for range clients.
+*/
+function sendStreamResponse(request,response,statusCode,headers,stream) {
+	var etag = headers["Etag"];
+	if(this.enableBrowserCache && (statusCode == 200) && etag) {
+		headers["Cache-Control"] = "max-age=0, must-revalidate";
+		var ifNoneMatch = request.headers["if-none-match"];
+		if(ifNoneMatch) {
+			var matchParts = ifNoneMatch.split(",").map(function(tag) {
+				return tag.replace(/^[ "]+|[ "]+$/g, "");
+			});
+			// The /files Etag is size/mtime-based and quoted; matchParts are unquoted
+			if(matchParts.indexOf(etag.replace(/^"|"$/g,"")) !== -1) {
+				// Keep the stream's file descriptor from leaking and answer 304.
+				// A 304 has no representation body, so drop the entity metadata
+				// the route prepared for the full response.
+				stream.destroy();
+				delete headers["Content-Length"];
+				delete headers["Content-Range"];
+				response.writeHead(304,headers);
+				response.end();
+				return;
+			}
+		}
+	} else {
+		headers["Cache-Control"] = headers["Cache-Control"] || "no-store";
+	}
+	response.writeHead(statusCode,headers);
+	// Backpressure is handled by pipe(). If the client disconnects, stop
+	// reading so the underlying file descriptor is released.
+	var cleanup = function() {
+		stream.destroy();
+		response.removeListener("close",cleanup);
+	};
+	response.once("close",cleanup);
+	stream.on("error",function(streamErr) {
+		console.log("Error streaming file response: " + streamErr.toString());
+		cleanup();
+		if(!response.headersSent) {
+			response.writeHead(500,{"Content-Type": "text/plain"});
+			response.end("Internal server error");
+		} else {
+			// Headers (and possibly bytes) are already on the wire: abandon
+			response.destroy();
+		}
+	});
+	stream.pipe(response);
 }
 
 Server.prototype.defaultVariables = {
